@@ -1,0 +1,94 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"          # tag like v0.1.0 to cut a release
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write     # needed for creating/uploading releases
+
+jobs:
+  build-linux:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable) with targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (release)
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="drill"
+          TARGET="${{ matrix.target }}"
+          OUTDIR="dist/${TARGET}"
+          mkdir -p "${OUTDIR}"
+          cp "target/${TARGET}/release/${BIN}" "${OUTDIR}/"  # binary
+          # Optional extras if present:
+          cp README.md "${OUTDIR}/" 2>/dev/null || true
+          cp LICENSE* "${OUTDIR}/" 2>/dev/null || true
+          TARBALL="drill-${TARGET}.tar.gz"
+          tar -C dist -czf "${TARBALL}" "${TARGET}"
+          echo "tarball=${TARBALL}" >> "$GITHUB_OUTPUT"
+
+      - name: Checksums
+        run: |
+          sha256sum "drill-${{ matrix.target }}.tar.gz" > "drill-${{ matrix.target }}.tar.gz.sha256"
+
+      - name: Upload artifacts (CI view)
+        uses: actions/upload-artifact@v4
+        with:
+          name: drill-${{ matrix.target }}
+          path: |
+            drill-${{ matrix.target }}.tar.gz
+            drill-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    # Only run on tag pushes
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-linux]
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create / Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
