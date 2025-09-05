@@ -1,6 +1,6 @@
 [package]
 name = "drill-cli"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 description = "A modern, simple TCP tunnel in Rust that exposes local ports to a remote server, bypassing standard NAT connection firewalls."
 keywords = ["network", "cli", "tunnel", "tcp"]
@@ -13,8 +13,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { version = "1.0.56", features = ["backtrace"] }
 clap = { version = "4.0.22", features = ["derive", "env"] }
-dashmap = "6.1.0"
-fastrand = "2.3.0"
+dashmap = "5.2.0"
+fastrand = "1.9.0"
 futures-util = { version = "0.3.21", features = ["sink"] }
 hex = "0.4.3"
 hmac = "0.12.1"
@@ -29,6 +29,5 @@ uuid = { version = "1.2.1", features = ["serde", "v4"] }
 
 [dev-dependencies]
 lazy_static = "1.4.0"
-rstest = "0.26.1"
+rstest = "0.15.0"
 tokio = { version = "1.17.0", features = ["sync"] }
-

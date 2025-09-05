@@ -10,6 +10,9 @@ on:
 permissions:
   contents: write     # needed for creating/uploading releases
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build-linux:
     name: linux (${{ matrix.target }})
@@ -20,9 +23,6 @@ jobs:
         target:
           - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-musl
-          # Add glibc if desired:
-          # - x86_64-unknown-linux-gnu
-          # - aarch64-unknown-linux-gnu
 
     steps:
       - name: Checkout
@@ -33,14 +33,18 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo
+      - name: Cache cargo (deps + target)
         uses: Swatinem/rust-cache@v2
 
-      - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+      # Use zig for MUSL cross-linking so this works under `act` (no Docker-in-Docker required)
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild
 
       - name: Build (release)
-        run: cross build --release --target ${{ matrix.target }}
+        run: cargo zigbuild --release --target ${{ matrix.target }}
 
       - name: Package
         id: pkg
@@ -68,7 +72,9 @@ jobs:
             drill-${{ matrix.target }}.tar.gz.sha256
           if-no-files-found: error
 
+  # Skip macOS on `act` (act doesn't provide real macOS runners; its Linux containers can't handle -arch/SDK flags)
   build-macos:
+    if: ${{ github.actor != 'nektos/act' }}
     name: macos (${{ matrix.target }})
     runs-on: macos-14  # Apple Silicon runners
     strategy:
@@ -87,7 +93,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo
+      - name: Cache cargo (deps + target)
         uses: Swatinem/rust-cache@v2
 
       - name: Build (release)
@@ -119,7 +125,9 @@ jobs:
             drill-${{ matrix.target }}.tar.gz.sha256
           if-no-files-found: error
 
+  # Skip Windows on `act` (no MSVC link.exe inside act's Linux containers)
   build-windows:
+    if: ${{ github.actor != 'nektos/act' }}
     name: windows (${{ matrix.target }})
     runs-on: windows-2022
     strategy:
@@ -138,7 +146,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo
+      - name: Cache cargo (deps + target)
         uses: Swatinem/rust-cache@v2
 
       - name: Build (release)
@@ -168,9 +176,9 @@ jobs:
             drill-${{ matrix.target }}.zip.sha256
           if-no-files-found: error
 
+  # Full release (GitHub runners)
   release:
-    # Only run on tag pushes
-    if: startsWith(github.ref, 'refs/tags/')
+    if: ${{ startsWith(github.ref, 'refs/tags/') && github.actor != 'nektos/act' }}
     needs:
       - build-linux
       - build-macos
@@ -194,5 +202,31 @@ jobs:
             dist/*.zip.sha256
           prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}
           generate_release_notes: true
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Local tag test release when running under `act` (linux artifacts only)
+  release-linux-only:
+    if: ${{ startsWith(github.ref, 'refs/tags/') && github.actor == 'nektos/act' }}
+    needs: build-linux
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create / Update GitHub Release (linux only)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
