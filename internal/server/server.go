@@ -12,6 +12,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"html"
 	"html/template"
 	"io"
 	"math/big"
@@ -468,7 +469,7 @@ func handlePublicRequest(ctx context.Context, w http.ResponseWriter, r *http.Req
 	tun, err := mgr.GetWithTenant(tenant, agentID)
 	if err != nil {
 		w.WriteHeader(502)
-		_, _ = w.Write([]byte("no agent for " + tenant + "/" + agentID))
+		_, _ = w.Write([]byte("no agent for " + html.EscapeString(tenant) + "/" + html.EscapeString(agentID)))
 		return
 	}
 	body, _ := io.ReadAll(http.MaxBytesReader(w, r.Body, 10<<20))
