@@ -1,5 +1,14 @@
 agent:
-  id: "autoglue"
+  tenant: "dragon-security"
+  id: "web"
   server: "https://getexposed.io"
+  auth: "super-secret-admin-token"
   to: "http://127.0.0.1:8080"
-  auth: "change-me"
+  web_targets:
+    web1: "http://127.0.0.1:8080"
+    web2: "http://127.0.0.1:8081"
+  tcp_targets:
+    db: "127.0.0.1:5432"
+    ssh: "127.0.0.1:22"
+  udp_targets:
+    stats: "127.0.0.1:8125"

@@ -10,24 +10,14 @@ type Logger struct {
 	*log.Logger
 }
 
-func NewLogger(prefix string) *Logger {
-	return &Logger{
-		prefix: prefix,
-		Logger: log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds),
-	}
+func NewLogger(p string) *Logger {
+	return &Logger{prefix: p, Logger: log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)}
 }
-
-func (l *Logger) withPrefix() string {
+func (l *Logger) p() string {
 	if l.prefix == "" {
 		return ""
 	}
 	return "[" + l.prefix + "] "
 }
-
-func (l *Logger) Infof(format string, v ...any) {
-	l.Printf(l.withPrefix()+format, v...)
-}
-
-func (l *Logger) Errorf(format string, v ...any) {
-	l.Printf(l.withPrefix()+"ERROR: "+format, v...)
-}
+func (l *Logger) Infof(f string, v ...any)  { l.Printf(l.p()+f, v...) }
+func (l *Logger) Errorf(f string, v ...any) { l.Printf(l.p()+"ERROR: "+f, v...) }

@@ -33,7 +33,7 @@ clean:
 	rm -rf $(DIST)
 
 # Build for all PLATFORMS (arm & amd64 included for each OS listed)
-build-all: ensure-dist
+build-all: clean ensure-dist
 	@set -e; for platform in $(PLATFORMS); do \
 		os=$${platform%/*}; arch=$${platform#*/}; \
 		ext=$$( [ $$os = windows ] && echo .exe || echo "" ); \

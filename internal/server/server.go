@@ -8,66 +8,66 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"html/template"
 	"io"
 	"math/big"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/DragonSecurity/drill/internal/server/tenancy"
+	"github.com/DragonSecurity/drill/pkg/proto"
+	"github.com/DragonSecurity/drill/pkg/util"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
 	prom "github.com/prometheus/client_golang/prometheus"
 	promhttp "github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
-
-	"github.com/DragonSecurity/drill/pkg/proto"
-	"github.com/DragonSecurity/drill/pkg/util"
 )
 
 type ACMEConfig struct {
-	Enable   bool
-	Email    string
-	CacheDir string
+	Enable          bool
+	Email, CacheDir string
 }
-
 type AuthConfig struct {
 	Enable bool
-	Token  string // simple shared token for agents
+	Token  string
+}
+type TenancyConfig struct {
+	Enable  bool
+	Storage string
+}
+type AdminConfig struct {
+	Enable bool
+	Token  string
 }
 
 type Config struct {
 	PublicAddr string
-	DomainBase string // e.g., "getexposed.io"
+	DomainBase string
 	ACME       ACMEConfig
 	Auth       AuthConfig
+	Tenancy    TenancyConfig
+	Admin      AdminConfig
+	TCPBinds   []TCPBind
+	UDPBinds   []UDPBind
 }
 
-// Metrics
 var (
-	metricActiveTunnels = prom.NewGauge(prom.GaugeOpts{
-		Name: "drill_active_tunnels",
-		Help: "Number of currently connected tunnels.",
-	})
-	metricRequestsTotal = prom.NewCounterVec(prom.CounterOpts{
-		Name: "drill_requests_total",
-		Help: "Total number of proxied requests to agents.",
-	}, []string{"tunnel", "method"})
-	metricRequestDuration = prom.NewHistogramVec(prom.HistogramOpts{
-		Name:    "drill_request_seconds",
-		Help:    "Duration of proxied requests.",
-		Buckets: prom.DefBuckets,
-	}, []string{"tunnel", "method", "status"})
+	metricActiveTunnels = prom.NewGauge(prom.GaugeOpts{Name: "revtun_active_tunnels", Help: "active tunnels"})
+	metricRequestsTotal = prom.NewCounterVec(prom.CounterOpts{Name: "revtun_requests_total", Help: "HTTP requests"}, []string{"tunnel", "method"})
+	metricRequestSecs   = prom.NewHistogramVec(prom.HistogramOpts{Name: "revtun_request_seconds", Help: "HTTP duration"}, []string{"tunnel", "method", "status"})
 )
 
-func init() {
-	prom.MustRegister(metricActiveTunnels, metricRequestsTotal, metricRequestDuration)
-}
+func init() { prom.MustRegister(metricActiveTunnels, metricRequestsTotal, metricRequestSecs) }
 
 type wsConn struct {
 	c   *websocket.Conn
@@ -75,66 +75,80 @@ type wsConn struct {
 }
 
 func (w *wsConn) ReadEnvelope() (*proto.Envelope, error) {
-	var env proto.Envelope
-	if err := w.c.ReadJSON(&env); err != nil {
+	var e proto.Envelope
+	if err := w.c.ReadJSON(&e); err != nil {
 		return nil, err
 	}
-	return &env, nil
+	return &e, nil
 }
-func (w *wsConn) WriteEnvelope(env *proto.Envelope) error {
+func (w *wsConn) WriteEnvelope(e *proto.Envelope) error {
 	w.wmu.Lock()
 	defer w.wmu.Unlock()
-	return w.c.WriteJSON(env)
+	return w.c.WriteJSON(e)
 }
 func (w *wsConn) Close() error { return w.c.Close() }
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1 << 14,
-	WriteBufferSize: 1 << 14,
-	CheckOrigin:     func(r *http.Request) bool { return true }, // TODO: tighten allowed origins
-}
+var upgrader = websocket.Upgrader{ReadBufferSize: 1 << 14, WriteBufferSize: 1 << 14, CheckOrigin: func(r *http.Request) bool { return true }}
 
 func Run(ctx context.Context, cfg Config, log *util.Logger) error {
 	mgr := NewManager()
-	r := routes(cfg, mgr, log)
+	reg := NewBindRegistry(ctx, mgr, log)
+	var store *tenancy.Store
+	if cfg.Tenancy.Enable {
+		store = tenancy.NewStore(cfg.Tenancy.Storage)
+		if err := store.Load(); err != nil {
+			return err
+		}
+	}
+
+	r := routesWithRegistry(cfg, mgr, store, reg, log)
+
+	deps := &ServerDeps{ctx: ctx, mgr: mgr, log: log}
+	for _, b := range cfg.TCPBinds {
+		bb := b
+		go func() {
+			if err := runTCPBind(deps, bb); err != nil {
+				log.Errorf("tcp bind %s: %v", bb.Addr, err)
+			}
+		}()
+	}
+	for _, b := range cfg.UDPBinds {
+		bb := b
+		go func() {
+			if err := runUDPBind(deps, bb); err != nil {
+				log.Errorf("udp bind %s: %v", bb.Addr, err)
+			}
+		}()
+	}
 
 	if cfg.ACME.Enable {
 		return runWithACME(ctx, cfg, r, log)
 	}
-	// Plain HTTP mode (dev)
-	srv := &http.Server{
-		Addr:              cfg.PublicAddr,
-		Handler:           r,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	srv := &http.Server{Addr: cfg.PublicAddr, Handler: r, ReadHeaderTimeout: 10 * time.Second}
 	return serveAndWait(ctx, srv, log)
 }
 
-func routes(cfg Config, mgr *Manager, log *util.Logger) http.Handler {
+func routesWithRegistry(cfg Config, mgr *Manager, store *tenancy.Store, reg *BindRegistry, log *util.Logger) http.Handler {
 	r := chi.NewRouter()
-	// Health and metrics
-	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
-	})
+	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200); _, _ = w.Write([]byte("ok")) })
 	r.Handle("/metrics", promhttp.Handler())
 
-	// Control plane (agent connects here)
+	// Control plane
 	r.Get("/_control", func(w http.ResponseWriter, r *http.Request) {
-		authOK := true
-		if cfg.Auth.Enable {
-			want := strings.TrimSpace(cfg.Auth.Token)
-			got := strings.TrimSpace(r.URL.Query().Get("auth"))
-			if want == "" || got != want {
-				authOK = false
+		tenant := r.URL.Query().Get("tenant")
+		if cfg.Tenancy.Enable {
+			if tenant == "" || store == nil || !store.Validate(tenant, r.URL.Query().Get("auth")) {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte("unauthorized"))
+				return
+			}
+		} else if cfg.Auth.Enable {
+			if strings.TrimSpace(r.URL.Query().Get("auth")) != strings.TrimSpace(cfg.Auth.Token) {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte("unauthorized"))
+				return
 			}
 		}
-		if !authOK {
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte("unauthorized: bad agent token"))
-			return
-		}
-
 		id := r.URL.Query().Get("id")
 		if id == "" {
 			id = randomID()
@@ -144,109 +158,272 @@ func routes(cfg Config, mgr *Manager, log *util.Logger) http.Handler {
 			log.Errorf("ws upgrade: %v", err)
 			return
 		}
-		conn := &wsConn{c: c}
-		t := &Tunnel{ID: id, Conn: conn, pending: make(map[string]*pendingResp)}
+		t := &Tunnel{Tenant: tenant, ID: id, Conn: &wsConn{c: c}}
 		mgr.Add(t)
 		metricActiveTunnels.Inc()
-		log.Infof("agent connected: %s", id)
-
+		log.Infof("agent connected: %s/%s", tenant, id)
 		go t.runReader(func() {
-			mgr.Remove(id)
+			mgr.RemoveWithTenant(tenant, id)
 			metricActiveTunnels.Dec()
-			log.Infof("agent disconnected: %s", id)
+			log.Infof("agent disconnected: %s/%s", tenant, id)
 		})
 	})
 
-	// Path-based routing: /t/{id}/*
-	r.Route("/t/{id}", func(rr chi.Router) {
+	// HTTP routing (path-based)
+	r.Route("/t/{tenant}/{id}", func(rr chi.Router) {
 		rr.HandleFunc("/*", func(w http.ResponseWriter, r *http.Request) {
-			handlePublicRequest(r.Context(), w, r, mgr, cfg, log, chi.URLParam(r, "id"), true)
+			handlePublicRequest(r.Context(), w, r, mgr, cfg, log, chi.URLParam(r, "tenant"), chi.URLParam(r, "id"), true)
 		})
 		rr.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			handlePublicRequest(r.Context(), w, r, mgr, cfg, log, chi.URLParam(r, "id"), true)
+			handlePublicRequest(r.Context(), w, r, mgr, cfg, log, chi.URLParam(r, "tenant"), chi.URLParam(r, "id"), true)
 		})
 	})
 
-	// Host-based routing: {id}.<domain-base>
+	// Host-based {service.}agentID--tenant.domain
 	r.HandleFunc("/*", func(w http.ResponseWriter, r *http.Request) {
-		id := tunnelIDFromHost(r.Host, cfg.DomainBase)
-		if id == "" {
+		left, tenant := idTenantFromHost(r.Host, cfg.DomainBase)
+		if left == "" || tenant == "" {
 			w.WriteHeader(200)
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			_, _ = w.Write([]byte(`<html><body><h3>drill server</h3><ul>` +
-				`<li>Health: <a href="/healthz">/healthz</a></li>` +
-				`<li>Metrics: <a href="/metrics">/metrics</a></li>` +
-				`</ul><p>Agent connected? Use <code>/t/{id}/</code> or host <code>{id}.` + cfg.DomainBase + `</code></p></body></html>`))
+			_, _ = w.Write([]byte(`<html><body><h3>drill</h3><ul><li><a href="/healthz">/healthz</a></li><li><a href="/metrics">/metrics</a></li></ul></body></html>`))
 			return
 		}
-		handlePublicRequest(r.Context(), w, r, mgr, cfg, log, id, false)
+		handlePublicRequest(r.Context(), w, r, mgr, cfg, log, tenant, left, false)
 	})
+
+	// Admin + Dynamic bind APIs (auth middleware reused)
+	if cfg.Admin.Enable {
+		r.Group(func(ar chi.Router) {
+			ar.Use(func(next http.Handler) http.Handler {
+				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					tok := r.Header.Get("X-Admin-Token")
+					if tok == "" {
+						tok = r.URL.Query().Get("token")
+					}
+					if strings.TrimSpace(tok) != strings.TrimSpace(cfg.Admin.Token) {
+						w.WriteHeader(http.StatusUnauthorized)
+						_, _ = w.Write([]byte("admin unauthorized"))
+						return
+					}
+					next.ServeHTTP(w, r)
+				})
+			})
+			ar.Get("/admin", func(w http.ResponseWriter, r *http.Request) {
+				if store == nil {
+					w.WriteHeader(500)
+					_, _ = w.Write([]byte("tenancy not enabled"))
+					return
+				}
+				tmpl := template.Must(template.New("admin").Parse(adminHTML))
+				_ = tmpl.Execute(w, map[string]any{"Token": cfg.Admin.Token, "Tenants": store.List(), "Tunnels": mgr.List()})
+			})
+			ar.Get("/admin/api/tenants", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, store.List()) })
+			ar.Post("/admin/api/tenants", func(w http.ResponseWriter, r *http.Request) {
+				name := r.FormValue("name")
+				token := r.FormValue("token")
+				if token == "" {
+					token = randomID() + randomID()
+				}
+				t, err := store.Create(name, token)
+				if err != nil {
+					w.WriteHeader(400)
+					_, _ = w.Write([]byte(err.Error()))
+					return
+				}
+				writeJSON(w, t)
+			})
+			ar.Post("/admin/api/tenants/{slug}/rotate", func(w http.ResponseWriter, r *http.Request) {
+				slug := chi.URLParam(r, "slug")
+				token := r.FormValue("token")
+				if token == "" {
+					token = randomID() + randomID()
+				}
+				t, err := store.Rotate(slug, token)
+				if err != nil {
+					w.WriteHeader(400)
+					_, _ = w.Write([]byte(err.Error()))
+					return
+				}
+				writeJSON(w, t)
+			})
+			ar.Delete("/admin/api/tenants/{slug}", func(w http.ResponseWriter, r *http.Request) {
+				slug := chi.URLParam(r, "slug")
+				if err := store.Delete(slug); err != nil {
+					w.WriteHeader(400)
+					_, _ = w.Write([]byte(err.Error()))
+					return
+				}
+				w.WriteHeader(204)
+			})
+			ar.Post("/admin/api/tunnels/{tenant}/{id}/disconnect", func(w http.ResponseWriter, r *http.Request) {
+				tn := chi.URLParam(r, "tenant")
+				id := chi.URLParam(r, "id")
+				if t, err := mgr.GetWithTenant(tn, id); err == nil {
+					_ = t.Conn.Close()
+				}
+				w.WriteHeader(204)
+			})
+			// binds
+			ar.Get("/admin/api/binds", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, reg.List()) })
+			ar.Post("/admin/api/binds/tcp", func(w http.ResponseWriter, r *http.Request) {
+				tenant := r.FormValue("tenant")
+				id := r.FormValue("id")
+				addr := r.FormValue("addr")
+				if addr == "" {
+					addr = ":0"
+				}
+				it, err := reg.StartTCP(tenant, id, addr)
+				if err != nil {
+					w.WriteHeader(400)
+					_, _ = w.Write([]byte(err.Error()))
+					return
+				}
+				writeJSON(w, it)
+			})
+			ar.Post("/admin/api/binds/udp", func(w http.ResponseWriter, r *http.Request) {
+				tenant := r.FormValue("tenant")
+				id := r.FormValue("id")
+				addr := r.FormValue("addr")
+				if addr == "" {
+					addr = ":0"
+				}
+				it, err := reg.StartUDP(tenant, id, addr)
+				if err != nil {
+					w.WriteHeader(400)
+					_, _ = w.Write([]byte(err.Error()))
+					return
+				}
+				writeJSON(w, it)
+			})
+			ar.Delete("/admin/api/binds/{proto}", func(w http.ResponseWriter, r *http.Request) {
+				proto := chi.URLParam(r, "proto")
+				tenant := r.URL.Query().Get("tenant")
+				id := r.URL.Query().Get("id")
+				addr := r.URL.Query().Get("addr")
+				_ = reg.Stop(proto, tenant, id, addr)
+				w.WriteHeader(204)
+			})
+		})
+	}
+
+	// Tenant self-service
+	if cfg.Tenancy.Enable {
+		r.Route("/api/tenant/{tenant}", func(tr chi.Router) {
+			tr.Use(func(next http.Handler) http.Handler {
+				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					tn := chi.URLParam(r, "tenant")
+					tok := r.Header.Get("X-Tenant-Token")
+					if tok == "" {
+						tok = r.URL.Query().Get("token")
+					}
+					if store == nil || !store.Validate(tn, tok) {
+						w.WriteHeader(http.StatusUnauthorized)
+						_, _ = w.Write([]byte("unauthorized"))
+						return
+					}
+					next.ServeHTTP(w, r)
+				})
+			})
+			tr.Get("/binds", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, reg.List()) })
+			tr.Post("/binds/tcp", func(w http.ResponseWriter, r *http.Request) {
+				tenant := chi.URLParam(r, "tenant")
+				id := r.FormValue("id")
+				addr := r.FormValue("addr")
+				if addr == "" {
+					addr = ":0"
+				}
+				it, err := reg.StartTCP(tenant, id, addr)
+				if err != nil {
+					w.WriteHeader(400)
+					_, _ = w.Write([]byte(err.Error()))
+					return
+				}
+				writeJSON(w, it)
+			})
+			tr.Post("/binds/udp", func(w http.ResponseWriter, r *http.Request) {
+				tenant := chi.URLParam(r, "tenant")
+				id := r.FormValue("id")
+				addr := r.FormValue("addr")
+				if addr == "" {
+					addr = ":0"
+				}
+				it, err := reg.StartUDP(tenant, id, addr)
+				if err != nil {
+					w.WriteHeader(400)
+					_, _ = w.Write([]byte(err.Error()))
+					return
+				}
+				writeJSON(w, it)
+			})
+			tr.Delete("/binds/{proto}", func(w http.ResponseWriter, r *http.Request) {
+				proto := chi.URLParam(r, "proto")
+				tenant := chi.URLParam(r, "tenant")
+				id := r.URL.Query().Get("id")
+				addr := r.URL.Query().Get("addr")
+				_ = reg.Stop(proto, tenant, id, addr)
+				w.WriteHeader(204)
+			})
+		})
+	}
+
 	return r
 }
 
+const adminHTML = `<!doctype html><html><head><meta charset="utf-8"><title>drill admin</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:ui-sans-serif,system-ui;max-width:1000px;margin:2rem auto;padding:0 1rem}table{border-collapse:collapse;width:100%}th,td{padding:.5rem;border-bottom:1px solid #ddd}h1{font-size:1.5rem}code{background:#f5f5f5;padding:.1rem .3rem;border-radius:.2rem}</style></head><body>
+<h1>drill admin</h1>
+<h2>Tenants</h2>
+<table><thead><tr><th>Slug</th><th>Name</th><th>Active</th><th>Actions</th></tr></thead><tbody>
+{{range .Tenants}}<tr><td><code>{{.Slug}}</code></td><td>{{.Name}}</td><td>{{.Active}}</td><td>
+<form method="post" action="/admin/api/tenants/{{.Slug}}/rotate?token={{$.Token}}" onsubmit="fetch(this.action,{method:'POST',body:new FormData(this)}).then(()=>location.reload());return false;" style="display:inline"><button>Rotate token</button></form>
+<form method="post" action="/admin/api/tenants/{{.Slug}}?token={{$.Token}}" onsubmit="fetch('/admin/api/tenants/{{.Slug}}?token={{$.Token}}',{method:'DELETE'}).then(()=>location.reload());return false;" style="display:inline"><button>Delete</button></form>
+</td></tr>{{end}}</tbody></table>
+<h3>Create tenant</h3>
+<form method="post" action="/admin/api/tenants?token={{$.Token}}" onsubmit="fetch(this.action,{method:'POST',body:new FormData(this)}).then(()=>location.reload());return false;">
+<input name="name" placeholder="tenant name"><input name="token" placeholder="(optional) token"><button>Create</button>
+</form>
+<h2>Active tunnels</h2>
+<table><thead><tr><th>Tenant</th><th>ID</th><th>Actions</th></tr></thead><tbody>
+{{range .Tunnels}}<tr><td><code>{{.Tenant}}</code></td><td><code>{{.ID}}</code></td><td>
+<form method="post" action="/admin/api/tunnels/{{.Tenant}}/{{.ID}}/disconnect?token={{$.Token}}" onsubmit="fetch(this.action,{method:'POST'}).then(()=>location.reload());return false;"><button>Disconnect</button></form>
+</td></tr>{{end}}</tbody></table>
+</body></html>`
+
 func runWithACME(ctx context.Context, cfg Config, h http.Handler, log *util.Logger) error {
-	// Autocert manager: allow apex and any subdomain of DomainBase.
 	policy := func(ctx context.Context, host string) error {
-		if sameHost(host, cfg.DomainBase) {
+		if sameHost(host, cfg.DomainBase) || strings.HasSuffix(host, "."+cfg.DomainBase) {
 			return nil
 		}
-		if strings.HasSuffix(host, "."+cfg.DomainBase) {
-			return nil
-		}
-		return errors.New("host not allowed by policy")
+		return errors.New("host not allowed")
 	}
-	mgr := &autocert.Manager{
-		Prompt:     autocert.AcceptTOS,
-		HostPolicy: policy,
-		Email:      cfg.ACME.Email,
-		Cache:      autocert.DirCache(cfg.ACME.CacheDir),
-	}
-
-	// HTTP server on :80 for challenges + redirect to HTTPS.
-	httpSrv := &http.Server{
-		Addr: ":80",
-		Handler: mgr.HTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			to := "https://" + hostOnly(r.Host) + r.URL.RequestURI()
-			http.Redirect(w, r, to, http.StatusMovedPermanently)
-		})),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-
-	// Prepare a fallback self-signed cert for the apex to avoid noisy "missing server name" errors
-	fallbackCert, err := selfSignedCert(cfg.DomainBase)
-	if err != nil {
-		log.Errorf("self-signed cert generation failed: %v", err)
-	}
-
+	mgr := &autocert.Manager{Prompt: autocert.AcceptTOS, HostPolicy: policy, Email: cfg.ACME.Email, Cache: autocert.DirCache(cfg.ACME.CacheDir)}
+	httpSrv := &http.Server{Addr: ":80", Handler: mgr.HTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		to := "https://" + hostOnly(r.Host) + r.URL.RequestURI()
+		http.Redirect(w, r, to, http.StatusMovedPermanently)
+	})), ReadHeaderTimeout: 10 * time.Second}
+	fallback, _ := selfSignedCert(cfg.DomainBase)
 	getCert := func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 		if hello == nil || hello.ServerName == "" {
-			if fallbackCert != nil {
-				return fallbackCert, nil
+			if fallback != nil {
+				return fallback, nil
 			}
-			return nil, errors.New("missing SNI (ServerName)")
+			return nil, errors.New("missing SNI")
 		}
 		return mgr.GetCertificate(hello)
 	}
-
-	// HTTPS server on cfg.PublicAddr (default :443)
 	httpsSrv := &http.Server{
 		Addr:    cfg.PublicAddr,
 		Handler: h,
 		TLSConfig: &tls.Config{
 			GetCertificate: getCert,
 			MinVersion:     tls.VersionTLS12,
-			NextProtos:     []string{"h2", "http/1.1"},
+			NextProtos:     []string{"h2", "http/1.1", acme.ALPNProto},
 		},
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-
-	// Run both
 	errCh := make(chan error, 2)
 	go func() { errCh <- httpSrv.ListenAndServe() }()
 	go func() { errCh <- httpsSrv.ListenAndServeTLS("", "") }()
-
-	log.Infof("ACME enabled: serving HTTP on :80 (redirect+challenges), HTTPS on %s; domainBase=%s", cfg.PublicAddr, cfg.DomainBase)
-
+	log.Infof("ACME: :80 redirect/challenge; HTTPS on %s", cfg.PublicAddr)
 	select {
 	case <-ctx.Done():
 		_ = httpSrv.Shutdown(context.Background())
@@ -262,14 +439,9 @@ func runWithACME(ctx context.Context, cfg Config, h http.Handler, log *util.Logg
 
 func serveAndWait(ctx context.Context, srv *http.Server, log *util.Logger) error {
 	errCh := make(chan error, 1)
-	go func() {
-		log.Infof("listening on %s (domainBase=%s)", srv.Addr, "(dev)")
-		errCh <- srv.ListenAndServe()
-	}()
-
+	go func() { log.Infof("listening on %s", srv.Addr); errCh <- srv.ListenAndServe() }()
 	select {
 	case <-ctx.Done():
-		log.Infof("shutting down...")
 		_ = srv.Shutdown(context.Background())
 		return nil
 	case err := <-errCh:
@@ -280,61 +452,66 @@ func serveAndWait(ctx context.Context, srv *http.Server, log *util.Logger) error
 	}
 }
 
-func handlePublicRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, mgr *Manager, cfg Config, log *util.Logger, id string, stripPrefix bool) {
+func handlePublicRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, mgr *Manager, cfg Config, log *util.Logger, tenant string, id string, strip bool) {
 	if id == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte("missing tunnel id"))
+		w.WriteHeader(400)
+		_, _ = w.Write([]byte("missing id"))
 		return
 	}
-	tun, err := mgr.Get(id)
+	// id may include service prefix: {service}.{agentID}
+	service := ""
+	agentID := id
+	if dot := strings.Index(agentID, "."); dot > 0 {
+		service = agentID[:dot]
+		agentID = agentID[dot+1:]
+	}
+	tun, err := mgr.GetWithTenant(tenant, agentID)
 	if err != nil {
-		w.WriteHeader(http.StatusBadGateway)
-		w.Write([]byte("no agent connected for tunnel: " + id))
+		w.WriteHeader(502)
+		_, _ = w.Write([]byte("no agent for " + tenant + "/" + agentID))
 		return
 	}
-
 	body, _ := io.ReadAll(http.MaxBytesReader(w, r.Body, 10<<20))
 	_ = r.Body.Close()
-
 	path := r.URL.Path
-	if stripPrefix {
-		prefix := "/t/" + id
-		path = strings.TrimPrefix(path, prefix)
+	if strip {
+		prefix := "/t/" + tenant + "/" + id
+		if strings.HasPrefix(path, prefix) {
+			path = strings.TrimPrefix(path, prefix)
+		}
 		if path == "" {
 			path = "/"
 		}
 	}
-
-	req := &proto.Request{
-		TunnelID:  id,
-		RequestID: randomID(),
-		Method:    r.Method,
-		Path:      path,
-		RawQuery:  r.URL.RawQuery,
-		Header:    filterHeaders(r.Header),
-		Body:      body,
+	// path-based service fallback: /_s/{service}/...
+	if strings.HasPrefix(path, "/_s/") {
+		rest := strings.TrimPrefix(path, "/_s/")
+		if p := strings.IndexByte(rest, '/'); p > 0 {
+			service = rest[:p]
+			path = rest[p:]
+		} else if rest != "" {
+			service = rest
+			path = "/"
+		}
 	}
-
+	req := &proto.Request{TunnelID: agentID, RequestID: randomID(), Service: service, Method: r.Method, Path: path, RawQuery: r.URL.RawQuery, Header: filterHeaders(r.Header), Body: body}
 	start := time.Now()
 	resp, err := tun.sendRequest(req, 30*time.Second)
 	dur := time.Since(start).Seconds()
 	if err != nil {
-		metricRequestsTotal.WithLabelValues(id, r.Method).Inc()
-		metricRequestDuration.WithLabelValues(id, r.Method, "bad_gateway").Observe(dur)
-		w.WriteHeader(http.StatusBadGateway)
-		w.Write([]byte("tunnel write failed: " + err.Error()))
+		metricRequestsTotal.WithLabelValues(agentID, r.Method).Inc()
+		metricRequestSecs.WithLabelValues(agentID, r.Method, "bad_gateway").Observe(dur)
+		w.WriteHeader(502)
+		_, _ = w.Write([]byte("tunnel write failed: " + err.Error()))
 		return
 	}
-
-	metricRequestsTotal.WithLabelValues(id, r.Method).Inc()
-	metricRequestDuration.WithLabelValues(id, r.Method, fmt.Sprintf("%d", resp.Status)).Observe(dur)
-
+	metricRequestsTotal.WithLabelValues(agentID, r.Method).Inc()
+	metricRequestSecs.WithLabelValues(agentID, r.Method, fmt.Sprintf("%d", resp.Status)).Observe(dur)
 	if resp.Error != "" {
-		w.WriteHeader(http.StatusGatewayTimeout)
-		w.Write([]byte(resp.Error))
+		w.WriteHeader(504)
+		_, _ = w.Write([]byte(resp.Error))
 		return
 	}
-
 	for k, vv := range sanitizeRespHeaders(resp.Header) {
 		for _, v := range vv {
 			w.Header().Add(k, v)
@@ -347,77 +524,45 @@ func handlePublicRequest(ctx context.Context, w http.ResponseWriter, r *http.Req
 	_, _ = w.Write(resp.Body)
 }
 
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+var hopByHop = map[string]bool{"connection": true, "proxy-connection": true, "keep-alive": true, "transfer-encoding": true, "te": true, "trailer": true, "upgrade": true}
+
 func filterHeaders(h http.Header) map[string][]string {
 	out := make(map[string][]string, len(h))
 	for k, v := range h {
 		lk := strings.ToLower(k)
-		if hopByHop[lk] {
-			continue
-		}
-		if lk == "host" {
+		if hopByHop[lk] || lk == "host" {
 			continue
 		}
 		out[k] = append([]string(nil), v...)
 	}
 	return out
 }
-
 func sanitizeRespHeaders(h map[string][]string) map[string][]string {
 	if h == nil {
 		return map[string][]string{}
 	}
 	out := make(map[string][]string, len(h))
 	for k, v := range h {
-		lk := strings.ToLower(k)
-		if hopByHop[lk] {
+		if hopByHop[strings.ToLower(k)] {
 			continue
 		}
 		out[k] = append([]string(nil), v...)
 	}
 	return out
 }
-
-var hopByHop = map[string]bool{
-	"connection":        true,
-	"proxy-connection":  true,
-	"keep-alive":        true,
-	"transfer-encoding": true,
-	"te":                true,
-	"trailer":           true,
-	"upgrade":           true,
-}
-
-func tunnelIDFromHost(hostport, base string) string {
-	host := hostOnly(hostport)
-	if !strings.HasSuffix(host, "."+base) {
-		return ""
+func hostOnly(hp string) string {
+	if i := strings.Index(hp, ":"); i >= 0 {
+		return hp[:i]
 	}
-	left := strings.TrimSuffix(host, "."+base)
-	if left == "" {
-		return ""
-	}
-	return left
+	return hp
 }
-
-func hostOnly(hostport string) string {
-	h := hostport
-	if i := strings.Index(hostport, ":"); i >= 0 {
-		h = hostport[:i]
-	}
-	return h
-}
-
-func sameHost(a, b string) bool {
-	return strings.EqualFold(hostOnly(a), hostOnly(b))
-}
-
-func randomID() string {
-	var b [6]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
-}
-
-// selfSignedCert creates a short-lived self-signed certificate for fallback/no-SNI handshakes.
+func sameHost(a, b string) bool { return strings.EqualFold(hostOnly(a), hostOnly(b)) }
+func randomID() string          { var b [6]byte; _, _ = rand.Read(b[:]); return hex.EncodeToString(b[:]) }
 func selfSignedCert(host string) (*tls.Certificate, error) {
 	if host == "" {
 		host = "localhost"
@@ -427,15 +572,7 @@ func selfSignedCert(host string) (*tls.Certificate, error) {
 		return nil, err
 	}
 	now := time.Now()
-	tmpl := x509.Certificate{
-		SerialNumber:          big.NewInt(now.UnixNano()),
-		Subject:               pkix.Name{CommonName: host},
-		NotBefore:             now.Add(-time.Hour),
-		NotAfter:              now.Add(24 * time.Hour),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-	}
+	tmpl := x509.Certificate{SerialNumber: big.NewInt(now.UnixNano()), Subject: pkix.Name{CommonName: host}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(24 * time.Hour), KeyUsage: x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, BasicConstraintsValid: true}
 	if ip := net.ParseIP(host); ip != nil {
 		tmpl.IPAddresses = []net.IP{ip}
 	} else {
@@ -454,8 +591,19 @@ func selfSignedCert(host string) (*tls.Certificate, error) {
 	return &pair, nil
 }
 
-// Optional: debug helper to dump incoming requests through the server.
-func dumpReq(r *http.Request) string {
-	b, _ := httputil.DumpRequest(r, true)
-	return string(b)
+// ONLY support {left}--{tenant}.{base}. "left" may be "service.agentID" or just agentID.
+func idTenantFromHost(hostport, base string) (left, tenant string) {
+	host := hostOnly(hostport)
+	if !strings.HasSuffix(host, "."+base) {
+		return "", ""
+	}
+	left = strings.TrimSuffix(host, "."+base)
+	if left == "" {
+		return "", ""
+	}
+	i := strings.LastIndex(left, "--")
+	if i <= 0 || i >= len(left)-2 {
+		return "", ""
+	}
+	return left[:i], left[i+2:]
 }

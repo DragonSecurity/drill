@@ -5,6 +5,9 @@ server:
     enable: true
     email: "you@example.com"
     cache: "/var/lib/drill-acme"
-  auth:
+  tenancy:
     enable: true
-    token: "change-me"
+    storage: "/var/lib/drill/tenants.json"
+  admin:
+    enable: true
+    token: "super-secret-admin-token"
