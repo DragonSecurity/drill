@@ -1,0 +1,5 @@
+agent:
+  id: "autoglue"
+  server: "https://getexposed.io"
+  to: "http://127.0.0.1:8080"
+  auth: "change-me"

@@ -1,0 +1,109 @@
+name: build-and-release
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'        # create a GitHub Release when pushing a tag like v1.2.3
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to publish GitHub Releases
+
+env:
+  APP_NAME: drill
+  # Build targets
+  PLATFORMS: linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
+  CGO_ENABLED: "0"
+  GOFLAGS: -trimpath
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-tags: true
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+          cache: true
+
+      - name: Compute version info
+        id: vars
+        shell: bash
+        run: |
+          # VERSION: tag name if we're on a tag; otherwise `git describe` or fallback to commit
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="$(git describe --tags --always --dirty || true)"
+          fi
+          COMMIT="$(git rev-parse --short HEAD)"
+          DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+          echo "version=${VERSION}"   | tee -a $GITHUB_OUTPUT
+          echo "commit=${COMMIT}"     | tee -a $GITHUB_OUTPUT
+          echo "date=${DATE}"         | tee -a $GITHUB_OUTPUT
+
+      - name: Build cross-platform binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+          PKG="$(go list -m)" # e.g. github.com/DragonSecurity/drill
+          LDFLAGS="-s -w -X ${PKG}/cmd.Version=${{ steps.vars.outputs.version }} -X ${PKG}/cmd.Commit=${{ steps.vars.outputs.commit }} -X ${PKG}/cmd.Date=${{ steps.vars.outputs.date }}"
+
+          for platform in ${PLATFORMS}; do
+            os="${platform%/*}"
+            arch="${platform#*/}"
+            ext=""
+            [[ "$os" == "windows" ]] && ext=".exe"
+
+            out="dist/${APP_NAME}_${os}_${arch}${ext}"
+            echo ">> building $out"
+
+            GOOS="$os" GOARCH="$arch" CGO_ENABLED=${CGO_ENABLED} \
+              go build ${GOFLAGS} -ldflags "${LDFLAGS}" -o "${out}" ./...
+
+            # package (zip for windows, tar.gz for others)
+            pkgbase="${APP_NAME}_${{ steps.vars.outputs.version }}_${os}_${arch}"
+            if [[ "$os" == "windows" ]]; then
+              zip -j "dist/${pkgbase}.zip" "${out}" README.md || zip -j "dist/${pkgbase}.zip" "${out}"
+            else
+              tar czf "dist/${pkgbase}.tar.gz" -C dist "$(basename "${out}")" || true
+              # also include README if present
+              if [[ -f README.md ]]; then
+                tar rf "dist/${pkgbase}.tar.gz" README.md
+                gzip -f "dist/${pkgbase}.tar.gz"
+              fi
+            fi
+          done
+
+          # checksums for packaged archives
+          (cd dist && shasum -a 256 * | tee SHA256SUMS)
+
+      - name: Upload build artifacts (PRs & branches)
+        if: github.event_name != 'push' || startsWith(github.ref, 'refs/heads/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-artifacts-${{ github.run_id }}
+          path: dist/*
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}   # mark pre-release if tag has a hyphen (e.g. v1.0.0-rc1)
+          generate_release_notes: true
+          files: |
+            dist/${{ env.APP_NAME }}_*
+            dist/SHA256SUMS

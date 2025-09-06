@@ -1,0 +1,10 @@
+server:
+  public: ":443"
+  domain_base: "getexposed.io"
+  acme:
+    enable: true
+    email: "you@example.com"
+    cache: "/var/lib/drill-acme"
+  auth:
+    enable: true
+    token: "change-me"
