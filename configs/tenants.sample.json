@@ -1,0 +1,8 @@
+[
+  {
+    "slug": "dragon-security",
+    "name": "Dragon Security",
+    "token": "super-secret-admin-token",
+    "active": true
+  }
+]

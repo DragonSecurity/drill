@@ -3,36 +3,26 @@ package tenancy
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
-	"time"
-)
-
-var (
-	ErrTenantExists = errors.New("tenant already exists")
-	ErrNoSuchTenant = errors.New("no such tenant")
 )
 
 type Tenant struct {
-	Name      string    `json:"name"`
-	Slug      string    `json:"slug"`
-	Token     string    `json:"token"`
-	Active    bool      `json:"active"`
-	CreatedAt time.Time `json:"created_at"`
+	Slug   string `json:"slug"`
+	Name   string `json:"name"`
+	Token  string `json:"token"`
+	Active bool   `json:"active"`
 }
 
 type Store struct {
 	path string
 	mu   sync.RWMutex
-	m    map[string]*Tenant
+	m    map[string]*Tenant // slug -> tenant
 }
 
 func NewStore(path string) *Store {
-	if path == "" {
-		path = "tenants.json"
-	}
 	return &Store{path: path, m: make(map[string]*Tenant)}
 }
 
@@ -41,81 +31,90 @@ func (s *Store) Load() error {
 	defer s.mu.Unlock()
 	b, err := os.ReadFile(s.path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
+		if errors.Is(err, os.ErrNotExist) {
+			// create empty file
+			if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
+				return err
+			}
+			s.m = map[string]*Tenant{}
+			return s.saveLocked()
 		}
 		return err
 	}
-	var mm map[string]*Tenant
-	if err := json.Unmarshal(b, &mm); err != nil {
+	var arr []*Tenant
+	if len(b) == 0 {
+		s.m = map[string]*Tenant{}
+		return nil
+	}
+	if err := json.Unmarshal(b, &arr); err != nil {
 		return err
 	}
-	s.m = mm
+	s.m = make(map[string]*Tenant, len(arr))
+	for _, t := range arr {
+		s.m[t.Slug] = t
+	}
 	return nil
 }
 
-// Save snapshots the current map and writes without holding the write lock.
-func (s *Store) Save() error {
-	s.mu.RLock()
-	data := make(map[string]*Tenant, len(s.m))
-	for k, v := range s.m {
-		cp := *v
-		data[k] = &cp
+func (s *Store) saveLocked() error {
+	arr := make([]*Tenant, 0, len(s.m))
+	for _, t := range s.m {
+		arr = append(arr, t)
 	}
-	path := s.path
-	s.mu.RUnlock()
-
-	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil && !os.IsExist(err) {
-			return err
-		}
-	}
-	b, err := json.MarshalIndent(data, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	b, _ := json.MarshalIndent(arr, "", "  ")
+	return os.WriteFile(s.path, b, 0o640)
 }
 
 func (s *Store) List() []*Tenant {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]*Tenant, 0, len(s.m))
+	arr := make([]*Tenant, 0, len(s.m))
 	for _, t := range s.m {
-		out = append(out, t)
+		arr = append(arr, t)
 	}
-	return out
+	return arr
 }
 
-func slugify(sname string) string {
-	s := strings.ToLower(sname)
-	repl := func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
-			return r
-		}
-		return '-'
-	}
-	return strings.Trim(strings.Map(repl, s), "-")
+func (s *Store) Validate(slug, token string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	t, ok := s.m[slug]
+	return ok && t.Active && t.Token == token
+}
+func (s *Store) ExistsActive(slug string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	t, ok := s.m[slug]
+	return ok && t.Active
 }
 
 func (s *Store) Create(name, token string) (*Tenant, error) {
-	slug := slugify(name)
-	if slug == "" {
-		return nil, errors.New("invalid tenant name")
-	}
 	s.mu.Lock()
-	if _, ok := s.m[slug]; ok {
-		s.mu.Unlock()
-		return nil, ErrTenantExists
+	defer s.mu.Unlock()
+	slug := Slugify(name)
+	if slug == "" {
+		return nil, fmt.Errorf("invalid name")
 	}
-	t := &Tenant{Name: name, Slug: slug, Token: token, Active: true, CreatedAt: time.Now().UTC()}
+	if _, exists := s.m[slug]; exists {
+		return nil, fmt.Errorf("tenant exists")
+	}
+	t := &Tenant{Slug: slug, Name: name, Token: token, Active: true}
 	s.m[slug] = t
-	s.mu.Unlock()
-	if err := s.Save(); err != nil {
+	if err := s.saveLocked(); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+func (s *Store) Rotate(slug, token string) (*Tenant, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.m[slug]
+	if !ok {
+		return nil, fmt.Errorf("not found")
+	}
+	t.Token = token
+	if err := s.saveLocked(); err != nil {
 		return nil, err
 	}
 	return t, nil
@@ -123,46 +122,35 @@ func (s *Store) Create(name, token string) (*Tenant, error) {
 
 func (s *Store) Delete(slug string) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, ok := s.m[slug]; !ok {
-		s.mu.Unlock()
-		return ErrNoSuchTenant
+		return fmt.Errorf("not found")
 	}
 	delete(s.m, slug)
-	s.mu.Unlock()
-	return s.Save()
+	return s.saveLocked()
 }
 
-func (s *Store) Rotate(slug, token string) (*Tenant, error) {
-	s.mu.Lock()
-	t, ok := s.m[slug]
-	if !ok {
-		s.mu.Unlock()
-		return nil, ErrNoSuchTenant
+// Slugify very simple
+func Slugify(s string) string {
+	out := make([]rune, 0, len(s))
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			out = append(out, r)
+		case r >= 'A' && r <= 'Z':
+			out = append(out, r+('a'-'A'))
+		case r == '-', r == '_':
+			out = append(out, r)
+		case r == ' ', r == '.':
+			out = append(out, '-')
+		}
 	}
-	t.Token = token
-	s.mu.Unlock()
-	if err := s.Save(); err != nil {
-		return nil, err
+	// trim dashes
+	for len(out) > 0 && (out[0] == '-' || out[0] == '_') {
+		out = out[1:]
 	}
-	return t, nil
-}
-
-func (s *Store) Get(slug string) (*Tenant, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	t, ok := s.m[slug]
-	if !ok {
-		return nil, ErrNoSuchTenant
+	for len(out) > 0 && (out[len(out)-1] == '-' || out[len(out)-1] == '_') {
+		out = out[:len(out)-1]
 	}
-	return t, nil
-}
-
-func (s *Store) Validate(slug, token string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	t, ok := s.m[slug]
-	if !ok || !t.Active {
-		return false
-	}
-	return strings.TrimSpace(t.Token) == strings.TrimSpace(token)
+	return string(out)
 }

@@ -2,22 +2,13 @@ package util
 
 import (
 	"log"
-	"os"
 )
 
-type Logger struct {
-	prefix string
-	*log.Logger
-}
+type Logger struct{ pfx string }
 
-func NewLogger(p string) *Logger {
-	return &Logger{prefix: p, Logger: log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)}
+func NewLogger(prefix string) *Logger { return &Logger{pfx: prefix} }
+func (l *Logger) printf(level, f string, a ...any) {
+	log.Printf("%s%s: "+f, append([]any{l.pfx, level}, a...)...)
 }
-func (l *Logger) p() string {
-	if l.prefix == "" {
-		return ""
-	}
-	return "[" + l.prefix + "] "
-}
-func (l *Logger) Infof(f string, v ...any)  { l.Printf(l.p()+f, v...) }
-func (l *Logger) Errorf(f string, v ...any) { l.Printf(l.p()+"ERROR: "+f, v...) }
+func (l *Logger) Infof(f string, a ...any)  { l.printf("", f, a...) }
+func (l *Logger) Errorf(f string, a ...any) { l.printf("ERROR: ", f, a...) }

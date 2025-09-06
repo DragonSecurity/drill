@@ -2,7 +2,7 @@ agent:
   tenant: "dragon-security"
   id: "web"
   server: "https://getexposed.io"
-  auth: "super-secret-admin-token"
+  auth: "tenant-token-here"
   to: "http://127.0.0.1:8080"
   web_targets:
     web1: "http://127.0.0.1:8080"

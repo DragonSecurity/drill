@@ -1,17 +1,13 @@
 package agent
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
-	"path"
 	"strings"
 	"sync"
 	"time"
@@ -22,252 +18,183 @@ import (
 )
 
 type Config struct {
-	Tenant     string
-	ID         string
-	AuthToken  string
-	ServerURL  string
-	LocalTo    string
-	WebTargets map[string]string
-	TCPTargets map[string]string
-	UDPTargets map[string]string
+	Tenant             string            `mapstructure:"tenant"`
+	ID                 string            `mapstructure:"id"`
+	Server             string            `mapstructure:"server"`
+	Auth               string            `mapstructure:"auth"`
+	To                 string            `mapstructure:"to"`
+	WebTargets         map[string]string `mapstructure:"web_targets"`
+	TCPTargets         map[string]string `mapstructure:"tcp_targets"`
+	UDPTargets         map[string]string `mapstructure:"udp_targets"`
+	InsecureSkipVerify bool              `mapstructure:"insecure_skip_verify"`
 }
 
-type safeWS struct {
-	c  *websocket.Conn
-	mu sync.Mutex
-}
-
-func (s *safeWS) WriteJSON(v any) error { s.mu.Lock(); defer s.mu.Unlock(); return s.c.WriteJSON(v) }
-
-type tcpLocal struct {
-	conn     net.Conn
-	id, dest string
+type LoggerLike interface {
+	Infof(string, ...any)
+	Errorf(string, ...any)
 }
 
 func Run(ctx context.Context, cfg Config, log *util.Logger) error {
-	if cfg.ServerURL == "" {
-		return errors.New("missing --server")
-	}
-	if cfg.LocalTo == "" {
-		cfg.LocalTo = "http://127.0.0.1:3000"
-	}
-	serverBase, err := url.Parse(cfg.ServerURL)
-	if err != nil {
-		return fmt.Errorf("invalid server url: %w", err)
-	}
-	localHTTP, err := url.Parse(cfg.LocalTo)
-	if err != nil {
-		return fmt.Errorf("invalid --to url: %w", err)
-	}
-
-	ctrl := *serverBase
-	ctrl.Path = path.Join(ctrl.Path, "/_control")
-	q := ctrl.Query()
+	ctlURL := strings.TrimRight(cfg.Server, "/") + "/_control"
+	q := url.Values{}
 	if cfg.Tenant != "" {
 		q.Set("tenant", cfg.Tenant)
+	}
+	if cfg.Auth != "" {
+		q.Set("auth", cfg.Auth)
 	}
 	if cfg.ID != "" {
 		q.Set("id", cfg.ID)
 	}
-	if cfg.AuthToken != "" {
-		q.Set("auth", cfg.AuthToken)
+	u, _ := url.Parse(ctlURL)
+	scheme := "ws"
+	if u.Scheme == "https" {
+		scheme = "wss"
 	}
-	ctrl.RawQuery = q.Encode()
-	wsCtrl := ctrl
-	if serverBase.Scheme == "https" {
-		wsCtrl.Scheme = "wss"
-	} else {
-		wsCtrl.Scheme = "ws"
-	}
+	u.Scheme = scheme
+	u.RawQuery = q.Encode()
 
-	log.Infof("dialing control: %s", wsCtrl.String())
-	dialer := websocket.Dialer{TLSClientConfig: &tls.Config{InsecureSkipVerify: serverBase.Scheme == "https" && (strings.Contains(serverBase.Host, "localhost") || strings.HasSuffix(serverBase.Host, ".local"))}, HandshakeTimeout: 10 * time.Second}
-	c, _, err := dialer.DialContext(ctx, wsCtrl.String(), nil)
+	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second, TLSClientConfig: &tls.Config{InsecureSkipVerify: cfg.InsecureSkipVerify}}
+	c, resp, err := dialer.DialContext(ctx, u.String(), nil)
 	if err != nil {
+		if resp != nil {
+			b, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			log.Errorf("ws dial failed: %s (resp: %s)", err, string(b))
+		}
 		return fmt.Errorf("ws dial failed: %w", err)
 	}
-	defer c.Close()
-	s := &safeWS{c: c}
+	log.Infof("connected. exposing local %s", cfg.To)
 
-	log.Infof("connected. HTTP %s | web_targets=%d | TCP=%d | UDP=%d", localHTTP.String(), len(cfg.WebTargets), len(cfg.TCPTargets), len(cfg.UDPTargets))
+	// Send register
+	reg := &proto.Register{ID: cfg.ID, Tenant: cfg.Tenant, To: cfg.To, WebTargets: cfg.WebTargets, TCPTargets: cfg.TCPTargets, UDPTargets: cfg.UDPTargets}
+	_ = c.WriteJSON(&proto.Envelope{Type: "register", Register: reg})
 
-	parsedWeb := map[string]*url.URL{}
-	for name, raw := range cfg.WebTargets {
-		if u, err := url.Parse(raw); err == nil {
-			parsedWeb[name] = u
-		}
-	}
+	a := &agent{cfg: cfg, log: log, c: c, httpc: &http.Client{Timeout: 25 * time.Second}}
+	return a.run(ctx)
+}
 
-	tcpMap := struct {
-		sync.Mutex
-		m map[string]*tcpLocal
-	}{m: make(map[string]*tcpLocal)}
+type agent struct {
+	cfg   Config
+	log   *util.Logger
+	c     *websocket.Conn
+	httpc *http.Client
 
+	tcpMu sync.Mutex
+	tcp   map[string]net.Conn // connID -> conn
+}
+
+func (a *agent) run(ctx context.Context) error {
+	a.tcp = map[string]net.Conn{}
 	for {
 		var env proto.Envelope
-		if err := c.ReadJSON(&env); err != nil {
+		if err := a.c.ReadJSON(&env); err != nil {
 			return err
 		}
 		switch env.Type {
-		case "request":
-			var req proto.Request
-			if json.Unmarshal(env.Payload, &req) != nil {
-				continue
-			}
-			go handleHTTPRequest(s, &req, localHTTP, parsedWeb, log)
+		case "http_request":
+			go a.handleHTTP(env.RequestID, env.Service, env.Request)
 		case "tcp_open":
-			var open proto.TCPOpen
-			if json.Unmarshal(env.Payload, &open) != nil {
-				continue
-			}
-			dest := cfg.TCPTargets[open.TunnelID]
-			if dest == "" {
-				dest = localHTTP.Host
-			}
-			go func(streamID, id, dst string) {
-				conn, err := net.DialTimeout("tcp", dst, 10*time.Second)
-				if err != nil {
-					cl := &proto.TCPClose{TunnelID: id, StreamID: streamID, Reason: err.Error()}
-					env, _ := proto.Wrap("tcp_close", cl)
-					_ = s.WriteJSON(env)
-					return
-				}
-				tcpMap.Lock()
-				tcpMap.m[streamID] = &tcpLocal{conn: conn, id: streamID, dest: dst}
-				tcpMap.Unlock()
-				buf := make([]byte, 32*1024)
-				for {
-					n, err := conn.Read(buf)
-					if n > 0 {
-						env, _ := proto.Wrap("tcp_data", &proto.TCPData{TunnelID: id, StreamID: streamID, Data: append([]byte(nil), buf[:n]...)})
-						_ = s.WriteJSON(env)
-					}
-					if err != nil {
-						_ = conn.Close()
-						cl := &proto.TCPClose{TunnelID: id, StreamID: streamID, Reason: errString(err)}
-						env, _ := proto.Wrap("tcp_close", cl)
-						_ = s.WriteJSON(env)
-						tcpMap.Lock()
-						delete(tcpMap.m, streamID)
-						tcpMap.Unlock()
-						return
-					}
-				}
-			}(open.StreamID, open.TunnelID, dest)
+			go a.handleTCPOpen(env.ConnID, env.Service)
 		case "tcp_data":
-			var d proto.TCPData
-			if json.Unmarshal(env.Payload, &d) != nil {
-				continue
-			}
-			tcpMap.Lock()
-			st := tcpMap.m[d.StreamID]
-			tcpMap.Unlock()
-			if st != nil {
-				_, _ = st.conn.Write(d.Data)
+			a.tcpMu.Lock()
+			conn := a.tcp[env.ConnID]
+			a.tcpMu.Unlock()
+			if conn != nil && len(env.Data) > 0 {
+				_, _ = conn.Write(env.Data)
 			}
 		case "tcp_close":
-			var cl proto.TCPClose
-			if json.Unmarshal(env.Payload, &cl) != nil {
-				continue
+			a.tcpMu.Lock()
+			conn := a.tcp[env.ConnID]
+			delete(a.tcp, env.ConnID)
+			a.tcpMu.Unlock()
+			if conn != nil {
+				_ = conn.Close()
 			}
-			tcpMap.Lock()
-			st := tcpMap.m[cl.StreamID]
-			delete(tcpMap.m, cl.StreamID)
-			tcpMap.Unlock()
-			if st != nil {
-				_ = st.conn.Close()
-			}
-		case "udp":
-			var d proto.UDPDatagram
-			if json.Unmarshal(env.Payload, &d) != nil {
-				continue
-			}
-			dst := cfg.UDPTargets[d.TunnelID]
-			if dst == "" {
-				continue
-			}
-			laddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
-			raddr, err := net.ResolveUDPAddr("udp", dst)
-			if err != nil {
-				continue
-			}
-			uc, err := net.DialUDP("udp", laddr, raddr)
-			if err != nil {
-				continue
-			}
-			_, _ = uc.Write(d.Data)
-			_ = uc.SetReadDeadline(time.Now().Add(1 * time.Second))
-			buf := make([]byte, 65535)
-			n, _, err := uc.ReadFromUDP(buf)
-			if err == nil && n > 0 {
-				reply := &proto.UDPDatagram{TunnelID: d.TunnelID, Client: d.Client, Direction: "to_client", Data: append([]byte(nil), buf[:n]...)}
-				env, _ := proto.Wrap("udp", reply)
-				_ = s.WriteJSON(env)
-			}
-			_ = uc.Close()
-		default:
 		}
 	}
 }
 
-func errString(err error) string {
-	if err == nil {
-		return ""
+func (a *agent) handleHTTP(reqID, service string, req *proto.Request) {
+	target := a.cfg.To
+	if service != "" && a.cfg.WebTargets != nil {
+		if t, ok := a.cfg.WebTargets[service]; ok {
+			target = t
+		}
 	}
-	return err.Error()
+	if target == "" {
+		_ = a.c.WriteJSON(&proto.Envelope{Type: "http_response", RequestID: reqID, Response: &proto.Response{Status: 502, Error: "no target"}})
+		return
+	}
+	base, err := url.Parse(target)
+	if err != nil {
+		_ = a.c.WriteJSON(&proto.Envelope{Type: "http_response", RequestID: reqID, Response: &proto.Response{Status: 502, Error: err.Error()}})
+		return
+	}
+	up := *base
+	up.Path = singleJoin(base.Path, req.Path)
+	up.RawQuery = req.RawQuery
+	httpReq, _ := http.NewRequest(req.Method, up.String(), io.NopCloser(strings.NewReader(string(req.Body))))
+	for k, vv := range req.Header {
+		for _, v := range vv {
+			httpReq.Header.Add(k, v)
+		}
+	}
+	httpReq.Header.Del("Accept-Encoding")
+	resp, err := a.httpc.Do(httpReq)
+	if err != nil {
+		_ = a.c.WriteJSON(&proto.Envelope{Type: "http_response", RequestID: reqID, Response: &proto.Response{Status: 502, Error: err.Error()}})
+		return
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	rhead := map[string][]string(resp.Header)
+	_ = a.c.WriteJSON(&proto.Envelope{Type: "http_response", RequestID: reqID, Response: &proto.Response{Status: resp.StatusCode, Header: rhead, Body: b}})
 }
 
-func handleHTTPRequest(ws *safeWS, req *proto.Request, localBase *url.URL, web map[string]*url.URL, log *util.Logger) {
-	start := time.Now()
-	resp := &proto.Response{TunnelID: req.TunnelID, RequestID: req.RequestID, Status: 502, Header: map[string][]string{}}
-	defer func() {
-		env, _ := proto.Wrap("response", resp)
-		_ = ws.WriteJSON(env)
-		log.Infof("%s %s -> %d (%s)", req.Method, req.Path, resp.Status, time.Since(start))
-	}()
-	base := localBase
-	if req.Service != "" {
-		if wu, ok := web[req.Service]; ok {
-			base = wu
-		}
+func singleJoin(a, b string) string {
+	if strings.HasSuffix(a, "/") && strings.HasPrefix(b, "/") {
+		return a + strings.TrimPrefix(b, "/")
 	}
-	u := *base
-	u.Path = singleJoiningSlash(base.Path, req.Path)
-	u.RawQuery = req.RawQuery
-	httpReq, err := http.NewRequest(req.Method, u.String(), io.NopCloser(bytes.NewReader(req.Body)))
-	if err != nil {
-		resp.Error = err.Error()
-		return
-	}
-	for k, v := range req.Header {
-		for _, vv := range v {
-			httpReq.Header.Add(k, vv)
-		}
-	}
-	httpReq.Host = base.Host
-	client := &http.Client{Timeout: 25 * time.Second}
-	localResp, err := client.Do(httpReq)
-	if err != nil {
-		resp.Error = err.Error()
-		return
-	}
-	defer localResp.Body.Close()
-	resp.Status = localResp.StatusCode
-	for k, v := range localResp.Header {
-		resp.Header[k] = append([]string(nil), v...)
-	}
-	b, _ := io.ReadAll(localResp.Body)
-	resp.Body = b
-}
-func singleJoiningSlash(a, b string) string {
-	sa := strings.HasSuffix(a, "/")
-	sb := strings.HasPrefix(b, "/")
-	switch {
-	case sa && sb:
-		return a + b[1:]
-	case !sa && !sb:
+	if !strings.HasSuffix(a, "/") && !strings.HasPrefix(b, "/") {
 		return a + "/" + b
-	default:
-		return a + b
 	}
+	return a + b
+}
+
+func (a *agent) handleTCPOpen(connID, service string) {
+	target, ok := a.cfg.TCPTargets[service]
+	if !ok {
+		_ = a.c.WriteJSON(&proto.Envelope{Type: "tcp_close", ConnID: connID})
+		return
+	}
+	conn, err := net.Dial("tcp", target)
+	if err != nil {
+		_ = a.c.WriteJSON(&proto.Envelope{Type: "tcp_close", ConnID: connID})
+		return
+	}
+	a.tcpMu.Lock()
+	a.tcp[connID] = conn
+	a.tcpMu.Unlock()
+	// Pump local->remote
+	go func() {
+		buf := make([]byte, 32<<10)
+		for {
+			n, err := conn.Read(buf)
+			if n > 0 {
+				// Copy data to new slice to avoid race
+				d := make([]byte, n)
+				copy(d, buf[:n])
+				_ = a.c.WriteJSON(&proto.Envelope{Type: "tcp_data", ConnID: connID, Data: d})
+			}
+			if err != nil {
+				_ = a.c.WriteJSON(&proto.Envelope{Type: "tcp_close", ConnID: connID})
+				_ = conn.Close()
+				a.tcpMu.Lock()
+				delete(a.tcp, connID)
+				a.tcpMu.Unlock()
+				return
+			}
+		}
+	}()
 }

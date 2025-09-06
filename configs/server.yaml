@@ -1,13 +1,19 @@
 server:
-  public: ":443"
+  public_addr: ":443"
   domain_base: "getexposed.io"
-  acme:
-    enable: true
-    email: "you@example.com"
-    cache: "/var/lib/drill-acme"
-  tenancy:
-    enable: true
-    storage: "/var/lib/drill/tenants.json"
   admin:
     enable: true
-    token: "super-secret-admin-token"
+    token: "change-me-admin-token"
+  tenancy:
+    enable: true
+    storage: "/etc/drill/tenants.json"
+  acme:
+    enable: false
+    email: "you@example.com"
+    cache: "/var/lib/drill-acme"
+    challenge: "http-01"     # or "dns-01"
+    dns_provider: ""         # set when challenge=dns-01 (cloudflare/route53)
+    ca: "letsencrypt"        # or "staging"
+sni:
+  enable: true
+  addr: ":8443"

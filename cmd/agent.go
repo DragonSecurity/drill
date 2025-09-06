@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -12,48 +13,25 @@ import (
 	"github.com/spf13/viper"
 )
 
-func init() {
-	agentCmd.Flags().String("tenant", "", "tenant slug (required when server.tenancy.enable=true)")
-	agentCmd.Flags().String("id", "", "tunnel id")
-	agentCmd.Flags().String("auth", "", "tenant token")
-	agentCmd.Flags().String("server", "http://localhost:8080", "server base URL")
-	agentCmd.Flags().String("to", "http://127.0.0.1:3000", "default HTTP target")
-
-	_ = viper.BindPFlag("agent.tenant", agentCmd.Flags().Lookup("tenant"))
-	_ = viper.BindPFlag("agent.id", agentCmd.Flags().Lookup("id"))
-	_ = viper.BindPFlag("agent.auth", agentCmd.Flags().Lookup("auth"))
-	_ = viper.BindPFlag("agent.server", agentCmd.Flags().Lookup("server"))
-	_ = viper.BindPFlag("agent.to", agentCmd.Flags().Lookup("to"))
-
-	rootCmd.AddCommand(agentCmd)
+type agentCfg struct {
+	Agent agent.Config `mapstructure:"agent"`
 }
 
 var agentCmd = &cobra.Command{
 	Use:   "agent",
-	Short: "run agent",
+	Short: "Run the drill agent",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		log := util.NewLogger("agent")
-		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-		defer cancel()
-		cfg := agent.Config{
-			Tenant:     viper.GetString("agent.tenant"),
-			ID:         viper.GetString("agent.id"),
-			AuthToken:  viper.GetString("agent.auth"),
-			ServerURL:  viper.GetString("agent.server"),
-			LocalTo:    viper.GetString("agent.to"),
-			WebTargets: map[string]string{},
-			TCPTargets: map[string]string{},
-			UDPTargets: map[string]string{},
+		var cfg agentCfg
+		if err := viper.Unmarshal(&cfg); err != nil {
+			return fmt.Errorf("decode agent config: %w", err)
 		}
-		if m := viper.GetStringMapString("agent.web_targets"); len(m) > 0 {
-			cfg.WebTargets = m
-		}
-		if m := viper.GetStringMapString("agent.tcp_targets"); len(m) > 0 {
-			cfg.TCPTargets = m
-		}
-		if m := viper.GetStringMapString("agent.udp_targets"); len(m) > 0 {
-			cfg.UDPTargets = m
-		}
-		return agent.Run(ctx, cfg, log)
+		log := util.NewLogger("[agent] ")
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return agent.Run(ctx, cfg.Agent, log)
 	},
+}
+
+func init() {
+	rootCmd.AddCommand(agentCmd)
 }
