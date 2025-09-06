@@ -12,6 +12,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"html"
 	"html/template"
 	"io"
 	"math/big"
