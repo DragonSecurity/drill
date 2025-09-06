@@ -19,11 +19,11 @@ func init() {
 	agentCmd.Flags().String("server", "http://localhost:8080", "server base URL")
 	agentCmd.Flags().String("to", "http://127.0.0.1:3000", "default HTTP target")
 
-	viper.BindPFlag("agent.tenant", agentCmd.Flags().Lookup("tenant"))
-	viper.BindPFlag("agent.id", agentCmd.Flags().Lookup("id"))
-	viper.BindPFlag("agent.auth", agentCmd.Flags().Lookup("auth"))
-	viper.BindPFlag("agent.server", agentCmd.Flags().Lookup("server"))
-	viper.BindPFlag("agent.to", agentCmd.Flags().Lookup("to"))
+	_ = viper.BindPFlag("agent.tenant", agentCmd.Flags().Lookup("tenant"))
+	_ = viper.BindPFlag("agent.id", agentCmd.Flags().Lookup("id"))
+	_ = viper.BindPFlag("agent.auth", agentCmd.Flags().Lookup("auth"))
+	_ = viper.BindPFlag("agent.server", agentCmd.Flags().Lookup("server"))
+	_ = viper.BindPFlag("agent.to", agentCmd.Flags().Lookup("to"))
 
 	rootCmd.AddCommand(agentCmd)
 }
