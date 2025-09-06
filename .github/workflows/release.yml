@@ -3,17 +3,15 @@ name: build-and-release
 on:
   push:
     branches: [ main, master ]
-    tags:
-      - 'v*'        # create a GitHub Release when pushing a tag like v1.2.3
+    tags: ['v*']     # create a Release on tag push (e.g. v1.2.3)
   pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: write   # needed to publish GitHub Releases
+  contents: write
 
 env:
   APP_NAME: drill
-  # Build targets
   PLATFORMS: linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
   CGO_ENABLED: "0"
   GOFLAGS: -trimpath
@@ -31,14 +29,13 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22.x'
+          go-version: '1.25'
           cache: true
 
-      - name: Compute version info
+      - name: Version info
         id: vars
         shell: bash
         run: |
-          # VERSION: tag name if we're on a tag; otherwise `git describe` or fallback to commit
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             VERSION="${GITHUB_REF_NAME}"
           else
@@ -46,19 +43,20 @@ jobs:
           fi
           COMMIT="$(git rev-parse --short HEAD)"
           DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          echo "version=${VERSION}" | tee -a $GITHUB_OUTPUT
+          echo "commit=${COMMIT}"   | tee -a $GITHUB_OUTPUT
+          echo "date=${DATE}"       | tee -a $GITHUB_OUTPUT
 
-          echo "version=${VERSION}"   | tee -a $GITHUB_OUTPUT
-          echo "commit=${COMMIT}"     | tee -a $GITHUB_OUTPUT
-          echo "date=${DATE}"         | tee -a $GITHUB_OUTPUT
-
-      - name: Build cross-platform binaries
+      - name: Build cross-platform
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p dist
-          PKG="$(go list -m)" # e.g. github.com/DragonSecurity/drill
-          LDFLAGS="-s -w -X ${PKG}/cmd.Version=${{ steps.vars.outputs.version }} -X ${PKG}/cmd.Commit=${{ steps.vars.outputs.commit }} -X ${PKG}/cmd.Date=${{ steps.vars.outputs.date }}"
+
+          # Inject ldflags into github.com/DragonSecurity/drill/cmd variables
+          PKG="github.com/DragonSecurity/drill"
+          PKG_CMD="${PKG}/cmd"
+          LDFLAGS="-s -w -X ${PKG_CMD}.Version=${{ steps.vars.outputs.version }} -X ${PKG_CMD}.Commit=${{ steps.vars.outputs.commit }} -X ${PKG_CMD}.Date=${{ steps.vars.outputs.date }}"
 
           for platform in ${PLATFORMS}; do
             os="${platform%/*}"
@@ -66,35 +64,46 @@ jobs:
             ext=""
             [[ "$os" == "windows" ]] && ext=".exe"
 
-            out="dist/${APP_NAME}_${os}_${arch}${ext}"
-            echo ">> building $out"
+            out_dir="dist/${APP_NAME}_${os}_${arch}"
+            bin="${APP_NAME}${ext}"
+            mkdir -p "${out_dir}"
 
+            echo ">> building ${out_dir}/${bin}"
+            # IMPORTANT: build a single package (the root main package), not ./...
             GOOS="$os" GOARCH="$arch" CGO_ENABLED=${CGO_ENABLED} \
-              go build ${GOFLAGS} -ldflags "${LDFLAGS}" -o "${out}" ./...
+              go build ${GOFLAGS} -ldflags "${LDFLAGS}" -o "${out_dir}/${bin}" .
 
-            # package (zip for windows, tar.gz for others)
             pkgbase="${APP_NAME}_${{ steps.vars.outputs.version }}_${os}_${arch}"
+
             if [[ "$os" == "windows" ]]; then
-              zip -j "dist/${pkgbase}.zip" "${out}" README.md || zip -j "dist/${pkgbase}.zip" "${out}"
-            else
-              tar czf "dist/${pkgbase}.tar.gz" -C dist "$(basename "${out}")" || true
-              # also include README if present
+              # Zip (flattened)
               if [[ -f README.md ]]; then
-                tar rf "dist/${pkgbase}.tar.gz" README.md
-                gzip -f "dist/${pkgbase}.tar.gz"
+                zip -j "dist/${pkgbase}.zip" "${out_dir}/${bin}" README.md
+              else
+                zip -j "dist/${pkgbase}.zip" "${out_dir}/${bin}"
               fi
+            else
+              # Tar.gz with a small staging dir to control names
+              staging="dist/_pkg_${os}_${arch}"
+              rm -rf "$staging"; mkdir -p "$staging"
+              cp "${out_dir}/${bin}" "$staging/"
+              [[ -f README.md ]] && cp README.md "$staging/" || true
+              (cd "$staging" && tar -czf "../${pkgbase}.tar.gz" .)
+              rm -rf "$staging"
             fi
           done
 
-          # checksums for packaged archives
-          (cd dist && shasum -a 256 * | tee SHA256SUMS)
+          # SHA256 checksums for packaged archives
+          (cd dist && sha256sum ${APP_NAME}_*.tar.gz ${APP_NAME}_*.zip > SHA256SUMS)
 
-      - name: Upload build artifacts (PRs & branches)
+      - name: Upload artifacts (branches/PRs)
         if: github.event_name != 'push' || startsWith(github.ref, 'refs/heads/')
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.APP_NAME }}-artifacts-${{ github.run_id }}
-          path: dist/*
+          path: |
+            dist/${{ env.APP_NAME }}_*
+            dist/SHA256SUMS
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
@@ -102,8 +111,9 @@ jobs:
         with:
           name: ${{ github.ref_name }}
           draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}   # mark pre-release if tag has a hyphen (e.g. v1.0.0-rc1)
+          prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
           files: |
-            dist/${{ env.APP_NAME }}_*
+            dist/${{ env.APP_NAME }}_*.tar.gz
+            dist/${{ env.APP_NAME }}_*.zip
             dist/SHA256SUMS
