@@ -1,3 +1,5 @@
-dist/
+build/
+.DS_Store
+internal/ui/
+cmd/drill-server/wire_gen.go
 .idea
-drill.yaml

@@ -109,7 +109,7 @@ func (s *DrillServer) handleHTTP() http.Handler {
 			userID := splitted[0]
 
 			if client, ok := s.sshServer.clients[userID]; ok {
-				w.Header().Set("X-Proxy", "bore")
+				w.Header().Set("X-Proxy", "drill")
 
 				if strings.ToLower(r.Header.Get("Upgrade")) == "websocket" {
 					url := &url.URL{Scheme: "ws", Host: fmt.Sprintf("%s:%d", client.addr, client.port)}
