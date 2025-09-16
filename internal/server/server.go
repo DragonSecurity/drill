@@ -205,18 +205,6 @@ func routesWithRegistry(cfg Config, mgr *Manager, store *tenancy.Store, reg *Bin
 		})
 	})
 
-	// Host-based {left}--{tenant}.{base}
-	r.HandleFunc("/*", func(w http.ResponseWriter, r *http.Request) {
-		left, tenant := idTenantFromHost(r.Host, cfg.DomainBase)
-		if left == "" || tenant == "" {
-			w.WriteHeader(200)
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			_, _ = w.Write([]byte(`<html><body><h3>drill</h3><ul><li><a href="/healthz">/healthz</a></li><li><a href="/metrics">/metrics</a></li></ul></body></html>`))
-			return
-		}
-		handlePublicRequest(r.Context(), w, r, mgr, cfg, log, tenant, left, false)
-	})
-
 	// Admin + binds
 	if cfg.Admin.Enable {
 		routesAdmin(r, cfg, store, mgr, reg, log)
@@ -288,6 +276,18 @@ func routesWithRegistry(cfg Config, mgr *Manager, store *tenancy.Store, reg *Bin
 			})
 		})
 	}
+
+	// Host-based {left}--{tenant}.{base}
+	r.HandleFunc("/*", func(w http.ResponseWriter, r *http.Request) {
+		left, tenant := idTenantFromHost(r.Host, cfg.DomainBase)
+		if left == "" || tenant == "" {
+			w.WriteHeader(200)
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<html><body><h3>drill</h3><ul><li><a href="/healthz">/healthz</a></li><li><a href="/metrics">/metrics</a></li></ul></body></html>`))
+			return
+		}
+		handlePublicRequest(r.Context(), w, r, mgr, cfg, log, tenant, left, false)
+	})
 
 	return r
 }
@@ -414,7 +414,7 @@ func routesAdmin(r chi.Router, cfg Config, store *tenancy.Store, mgr *Manager, r
 			name := r.FormValue("name")
 			token := r.FormValue("token")
 			if token == "" {
-				token = randomID() + randomID()
+				token = randomToken()
 			}
 			t, err := store.Create(name, token)
 			if err != nil {
@@ -428,7 +428,7 @@ func routesAdmin(r chi.Router, cfg Config, store *tenancy.Store, mgr *Manager, r
 			slug := chi.URLParam(r, "slug")
 			token := r.FormValue("token")
 			if token == "" {
-				token = randomID() + randomID()
+				token = randomToken()
 			}
 			t, err := store.Rotate(slug, token)
 			if err != nil {
@@ -701,8 +701,21 @@ func hostOnly(hp string) string {
 	}
 	return hp
 }
-func sameHost(a, b string) bool { return strings.EqualFold(hostOnly(a), hostOnly(b)) }
-func randomID() string          { var b [6]byte; _, _ = rand.Read(b[:]); return hex.EncodeToString(b[:]) }
+func sameHost(a, b string) bool {
+	return strings.EqualFold(hostOnly(a), hostOnly(b))
+}
+
+func randomID() string {
+	var b [6]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+func randomToken() string {
+	var b [32]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
 
 func selfSignedCert(host string) (*tls.Certificate, error) {
 	if host == "" {
