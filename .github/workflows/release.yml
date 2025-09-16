@@ -36,11 +36,10 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
           cache-dependency-path: |
-            web/drill/package-lock.json
-            web/drill/npm-shrinkwrap.json
+            web/drill/yarn.lock
 
       - name: Install system deps
         run: |

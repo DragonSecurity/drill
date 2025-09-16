@@ -57,7 +57,7 @@ build_client:
 build_ui_landing:
 	@if [ ! -d "web/drill/dist" ]; then \
 		echo "→ building UI landing"; \
-		cd web/drill && npm run build; \
+		cd web/drill && yarn build; \
 	fi
 
 wire:
@@ -71,11 +71,11 @@ static_landing: build_ui_landing
 	fi
 
 install_dependencies:
-	@echo "→ installing Go/NPM tools (no gox)"
+	@echo "→ installing Go/YARN tools"
 	@go get github.com/jkuri/statik github.com/google/wire/cmd/...
 	@go install github.com/jkuri/statik
 	@go install github.com/google/wire/cmd/...
-	@cd web/drill && npm install
+	@cd web/drill && yarn install
 
 clean:
 	@echo "→ cleaning"

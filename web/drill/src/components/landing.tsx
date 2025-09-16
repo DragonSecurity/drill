@@ -6,7 +6,7 @@ export function Landing(): JSX.Element {
         <>
             <div className="hidden sm:mb-8 sm:flex sm:justify-center">
                 <div className="relative rounded-full bg-white px-3 py-1 text-sm leading-6 text-gray-600 ring-1 ring-gray-900/10 hover:ring-gray-900/20">
-                    Drill v0.5.2 now released.{' '}
+                    Drill v0.5.3 now released.{' '}
                     <a
                         href="https://github.com/dragonsecurity/drill/releases"
                         className="font-semibold text-pink-500"
