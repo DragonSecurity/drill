@@ -14,6 +14,11 @@ RUN --mount=type=cache,target=/root/.npm \
 FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
 WORKDIR /src
 
+ARG BUILDPLATFORM
+ARG TARGETPLATFORM
+ARG TARGETOS
+ARG TARGETARCH
+
 # Faster, repeatable builds
 RUN apk add --no-cache ca-certificates git
 COPY go.mod go.sum ./
@@ -29,7 +34,6 @@ ARG VERSION_PATH=github.com/DragonSecurity/drill/internal/version
 ARG GIT_COMMIT=unknown
 ARG UI_VERSION=container
 ARG BUILD_DATE=unknown
-ARG TARGETOS=TARGETARCH
 
 ENV CGO_ENABLED=0
 RUN --mount=type=cache,target=/root/.cache/go-build \

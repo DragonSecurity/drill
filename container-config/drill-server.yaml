@@ -1,4 +1,4 @@
-domain: mydomain.com
+domain: localhost
 httpaddr: 0.0.0.0:2000
 sshaddr: 0.0.0.0:2200
 log:
