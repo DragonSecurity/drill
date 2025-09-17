@@ -1,4 +1,13 @@
-# syntax=docker/dockerfile:1.6
+############################
+# UI build (Node)
+############################
+FROM node:22-alpine AS ui
+WORKDIR /ui
+# bring in the UI sources
+COPY web/drill ./web/drill
+RUN --mount=type=cache,target=/root/.npm \
+    sh -lc 'cd web/drill &&  yarn install && yarn build'
+
 ############################
 # Build stage
 ############################
@@ -13,13 +22,14 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 # Bring in the source
 COPY . .
+COPY --from=ui /ui/web/drill/dist ./web/drill/dist
 
 # Build args for version info (optional)
 ARG VERSION_PATH=github.com/DragonSecurity/drill/internal/version
 ARG GIT_COMMIT=unknown
 ARG UI_VERSION=container
 ARG BUILD_DATE=unknown
-ARG TARGETOS TARGETARCH
+ARG TARGETOS=TARGETARCH
 
 ENV CGO_ENABLED=0
 RUN --mount=type=cache,target=/root/.cache/go-build \

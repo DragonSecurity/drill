@@ -65,7 +65,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	client := client.NewDrillClient(client.Config{
+	drillClient := client.NewDrillClient(client.Config{
 		RemoteServer: *remoteServer,
 		RemotePort:   *remotePort,
 		LocalServer:  *localServer,
@@ -77,7 +77,7 @@ func main() {
 	})
 
 connect:
-	if err := client.Run(); err != nil {
+	if err := drillClient.Run(); err != nil {
 		if !*autoReconnect {
 			log.Fatal(err)
 		}
