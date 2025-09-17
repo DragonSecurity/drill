@@ -1,0 +1,13 @@
+# docker-compose.yml
+services:
+  drill-server:
+    image: getexposed/drill-server:latest
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:2000:2000"  # Nginx on host reaches this
+      - "2200:2200"            # clients connect here
+    volumes:
+      - ./container-config:/etc/drill
+      - ./drill-data:/data
+    command: ["-config", "/etc/drill/drill-server.yaml"]

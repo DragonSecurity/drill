@@ -6,7 +6,7 @@ export function Landing(): JSX.Element {
         <>
             <div className="hidden sm:mb-8 sm:flex sm:justify-center">
                 <div className="relative rounded-full bg-white px-3 py-1 text-sm leading-6 text-gray-600 ring-1 ring-gray-900/10 hover:ring-gray-900/20">
-                    Drill v0.5.3 now released.{' '}
+                    Drill v0.5.4 now released.{' '}
                     <a
                         href="https://github.com/dragonsecurity/drill/releases"
                         className="font-semibold text-pink-500"
@@ -21,13 +21,13 @@ export function Landing(): JSX.Element {
                     Expose Yourself to the World!
                 </h1>
                 <p className="mt-8 text-lg leading-8 text-zinc-900">
-                    Rolling behind NAT and quickly want to show your work to a collegue,
+                    Rolling behind NAT and quickly want to show your work to a colleague,
                     download bore client and make secure tunnel over SSH protocol.
                 </p>
                 <div className="mt-16 flex items-center justify-center gap-x-6">
                     <a
                         href="https://github.com/dragonsecurity/drill/releases"
-                        className="inline-flex items-center rounded-md bg-green-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-green-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-green-500"
+                        className="inline-flex items-center rounded-md bg-green-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-green-500 focus-visible:outline focus-visible:outline-offset-2 focus-visible:outline-green-500"
                     >
                         Download
                         <DownloadIcon className="ml-2" />

@@ -1,0 +1,13 @@
+domain: mydomain.com
+httpaddr: 0.0.0.0:2000
+sshaddr: 0.0.0.0:2200
+log:
+  filename: /data/drill-server.log   # optional, or omit if stdout is enough
+  level: debug
+  max_age: 3
+  max_backups: 3
+  max_size: 500
+  stdout: true
+password: ""
+privatekey: /etc/drill/id_rsa
+publickey: /etc/drill/id_rsa.pub

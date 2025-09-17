@@ -32,7 +32,7 @@ Options:
 
 -a, Keep tunnel connection alive (default: true)
 
--r, Auto-reconnect if connection failed (default: false)
+-r, Auto-reconnect if connection failed (default: true)
 
 -version, prints drill version and build info
 
@@ -49,7 +49,7 @@ var (
 	id            = flag.String("id", "", "")
 	password      = flag.String("pw", "", "")
 	keepAlive     = flag.Bool("a", true, "")
-	autoReconnect = flag.Bool("r", false, "")
+	autoReconnect = flag.Bool("r", true, "")
 	versionFlag   = flag.Bool("version", false, "version")
 )
 

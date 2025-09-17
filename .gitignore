@@ -3,3 +3,6 @@ build/
 internal/ui/
 cmd/drill-server/wire_gen.go
 .idea
+container-config/id_rsa
+container-config/id_rsa.pub
+drill-data/drill-server.log
