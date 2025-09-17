@@ -37,10 +37,15 @@ ARG BUILD_DATE=unknown
 
 ENV CGO_ENABLED=0
 RUN --mount=type=cache,target=/root/.cache/go-build \
-    GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -trimpath \
-      -ldflags "-s -w -X ${VERSION_PATH}.GitCommit=${GIT_COMMIT} -X ${VERSION_PATH}.UIVersion=${UI_VERSION} -X ${VERSION_PATH}.BuildDate=${BUILD_DATE}" \
-      -o /out/drill-server ./cmd/drill-server
+    --mount=type=cache,target=/go/pkg/mod \
+    sh -euxo pipefail -c '
+      echo "BUILDPLATFORM=$BUILDPLATFORM TARGETPLATFORM=$TARGETPLATFORM TARGETOS=$TARGETOS TARGETARCH=$TARGETARCH"
+      test -n "$TARGETOS" && test -n "$TARGETARCH"
+      GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
+      go build -trimpath \
+        -ldflags "-s -w -X ${VERSION_PATH}.GitCommit=${GIT_COMMIT} -X ${VERSION_PATH}.UIVersion=${UI_VERSION} -X ${VERSION_PATH}.BuildDate=${BUILD_DATE}" \
+        -o /out/drill-server ./cmd/drill-server
+    '
 
 ############################
 # Runtime stage

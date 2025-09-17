@@ -59,6 +59,8 @@ jobs:
       # Build & push multi-arch image using your Dockerfile at repo root
       - name: Build and push
         uses: docker/build-push-action@v5
+        env:
+          BUILDKIT_PROGRESS: plain
         with:
           context: .
           file: ./Dockerfile
