@@ -1,6 +1,23 @@
 # Drill
 Reverse HTTP/TCP proxy tunnel via secure SSH connections.
 
+# Automated
+## Installers
+
+### Server
+Systemd setup: For Linux servers, run the installer with `WITH_SYSTEMD=1 and (optionally) DRILL_DOMAIN, DRILL_HTTPADDR, DRILL_SSHADDR, DRILL_PASSWORD` set:
+
+```
+WITH_SYSTEMD=1 DRILL_DOMAIN=example.com DRILL_HTTPADDR=0.0.0.0:80 DRILL_SSHADDR=0.0.0.0:2200 \
+/bin/bash -c "$(curl -fsSL https://dl.getexposed.io/server.sh)"
+```
+
+### Client
+```
+/bin/bash -c "$(curl -fsSL https://dl.getexposed.io/client.sh)"
+
+```
+# From Source
 ## Client
 ### Installation
 You can download prebuild binaries [here](https://github.com/DragonSecurity/drill/releases).
@@ -8,7 +25,7 @@ You can download prebuild binaries [here](https://github.com/DragonSecurity/dril
 ### Build from source
 First, clone the repository
 ```bash
-git clone https://github.com/jkuri/bore.git
+git clone https://github.com/dragonsecurity/drill.git
 ```
 Then install client:
 
@@ -211,3 +228,4 @@ sudo systemctl enable --now drill-server
 
 You can watch the logs, either with `journalctl -u drill-server -f`
 or `tail -f /var/log/drill/drill-server.log`
+
