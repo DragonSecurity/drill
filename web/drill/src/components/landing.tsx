@@ -25,6 +25,8 @@ export function Landing(): JSX.Element {
                     download bore client and make secure tunnel over SSH protocol.
                 </p>
                 <div className="mt-16 flex items-center justify-center gap-x-6">
+                    <p>Install Agent: <code>/bin/bash -c "$(curl -fsSL https://dl.domain.com/agent.sh)"</code></p>
+                    <p>Install Server: <code>/bin/bash -c "$(curl -fsSL https://dl.domain.com/server.sh)"</code></p>
                     <a
                         href="https://github.com/dragonsecurity/drill/releases"
                         className="inline-flex items-center rounded-md bg-green-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-green-500 focus-visible:outline focus-visible:outline-offset-2 focus-visible:outline-green-500"
