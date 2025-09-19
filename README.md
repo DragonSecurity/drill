@@ -14,7 +14,7 @@ WITH_SYSTEMD=1 DRILL_DOMAIN=example.com DRILL_HTTPADDR=0.0.0.0:80 DRILL_SSHADDR=
 
 ### Client
 ```
-/bin/bash -c "$(curl -fsSL https://dl.getexposed.io/client.sh)"
+/bin/bash -c "$(curl -fsSL https://dl.getexposed.io/agent.sh)"
 
 ```
 # From Source
@@ -78,7 +78,7 @@ Generated HTTPS URL: https://fe2d57f3.example.com
 Direct TCP: tcp://example.com:55000
 ```
 
-Note that for hosted bore you need to specify port in range 45000-65000.
+Note that for hosted drill you need to specify port in range 45000-65000.
 
 If port is already taken, random port is used.
 
