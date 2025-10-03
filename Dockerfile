@@ -1,7 +1,7 @@
 ############################
 # UI build (Node)
 ############################
-FROM node:22-alpine AS ui
+FROM node:22.4.1-alpine@sha256:ba898e86c2cc720c8cf2ae05f8d2d4697fe0c8ca3e920d6fbf14a6cbf50bb9ca AS ui
 WORKDIR /ui
 # bring in the UI sources
 COPY web/drill ./web/drill
