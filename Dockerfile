@@ -11,7 +11,7 @@ RUN --mount=type=cache,target=/root/.npm \
 ############################
 # Build stage
 ############################
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine@sha256:b6ed3fd0452c0e9bcdef5597f29cc1418f61672e9d3a2f55bf02e7222c014abd AS build
 WORKDIR /src
 
 ARG BUILDPLATFORM
@@ -49,7 +49,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 ############################
 # Runtime stage
 ############################
-FROM gcr.io/distroless/static:nonroot AS runtime
+FROM gcr.io/distroless/static:nonroot@sha256:e8a4044e0b4ae4257efa45fc026c0bc30ad320d43bd4c1a7d5271bd241e386d0 AS runtime
 WORKDIR /app
 
 # Copy the server
